@@ -640,6 +640,14 @@ main(int argc, char *argv[])
    if (!plugins_init())
       return EXIT_FAILURE;
 
+   // simulate output creation events, so plugins catch them
+   {
+      size_t memb;
+      const wlc_handle *handles = wlc_get_outputs(&memb);
+      for (size_t i = 0; i < memb; ++i)
+         output_created(handles[i]);
+   }
+
    plog(0, PLOG_INFO, "orbment started");
    wlc_run();
 

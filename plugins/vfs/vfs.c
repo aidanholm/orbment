@@ -17,6 +17,11 @@ struct connection {
    int fd;
 };
 
+struct cnode {
+   size_t node;
+   plugin_h owner;
+};
+
 struct container {
    struct chck_iter_pool nodes;
    size_t root;
@@ -130,13 +135,13 @@ find_node(struct container *c, const char *name)
 {
    assert(c);
 
-   size_t *i;
-   chck_iter_pool_for_each(&c->nodes, i) {
+   struct cnode *cn;
+   chck_iter_pool_for_each(&c->nodes, cn) {
       struct node *n;
-      if (!(n = get_node(&plugin.fs, *i)) || !pi9_string_eq_cstr(&n->stat.name, name))
+      if (!(n = get_node(&plugin.fs, cn->node)) || !pi9_string_eq_cstr(&n->stat.name, name))
          continue;
 
-      return *i;
+      return cn->node;
    }
    return NONODE;
 }
@@ -175,11 +180,11 @@ reply(uint16_t tag, const void *src, size_t size, size_t nmemb, struct pi9_strea
 }
 
 static bool
-add_node(const char *container, const char *path, const char *type, void *arg, const struct function *read, const struct function *write, const struct function *clunk, const struct function *size)
+add_node(plugin_h caller, const char *container, const char *path, const char *type, void *arg, const struct function *read, const struct function *write, const struct function *clunk, const struct function *size)
 {
    const char *name;
    struct container *c;
-   if (!container || !path || !(name = chck_basename(path)) || !(c = chck_hash_table_str_get(&plugin.containers, container, strlen(container))))
+   if (!caller || !container || !path || !(name = chck_basename(path)) || !(c = chck_hash_table_str_get(&plugin.containers, container, strlen(container))))
       return false;
 
    struct {
@@ -223,19 +228,27 @@ add_node(const char *container, const char *path, const char *type, void *arg, c
          ret = add_file(parent, name, &procs, arg);
       }
       break;
+
       case TDIR:
          ret = add_dir(parent, name, arg);
       break;
-      case LAST: break;
+
+      case LAST:
+      break;
    }
 
    if (ret == NONODE)
       return false;
 
-   if (!c->nodes.items.member && !chck_iter_pool(&c->nodes, 32, 0, sizeof(size_t)))
+   if (!c->nodes.items.member && !chck_iter_pool(&c->nodes, 4, 0, sizeof(struct cnode)))
       goto fail;
 
-   if (!chck_iter_pool_push_back(&c->nodes, &ret))
+   struct cnode cnode = {
+      .node = ret,
+      .owner = caller,
+   };
+
+   if (!chck_iter_pool_push_back(&c->nodes, &cnode))
       goto fail;
 
    return true;
@@ -246,9 +259,9 @@ fail:
 }
 
 static bool
-add_fs(plugin_h caller, const char *name)
+add_fs_to(size_t parent, plugin_h owner, const char *name)
 {
-   if (!caller)
+   if (!owner)
       return false;
 
    if (!plugin.containers.lut.table && !chck_hash_table(&plugin.containers, 0, 256, sizeof(struct container)))
@@ -261,12 +274,35 @@ add_fs(plugin_h caller, const char *name)
 
    struct container container;
    memset(&container, 0, sizeof(container));
-   container.owner = caller;
+   container.owner = owner;
 
-   if ((container.root = add_dir(plugin.plugins, name, NULL)) == NONODE)
+   if ((container.root = add_dir(parent, name, NULL)) == NONODE)
       return false;
 
-   return chck_hash_table_str_set(&plugin.containers, name, strlen(name), &container);
+   if (!chck_hash_table_str_set(&plugin.containers, name, strlen(name), &container))
+      goto error0;
+
+   plog(plugin.self, PLOG_INFO, "added fs: %s", name);
+   return true;
+
+error0:
+   fs_remove_node(&plugin.fs, get_node(&plugin.fs, container.root));
+   return false;
+}
+
+static bool
+add_fs(plugin_h caller, const char *name)
+{
+   return add_fs_to(plugin.plugins, caller, name);
+}
+
+static void
+cnode_release(struct cnode *cn)
+{
+   if (!cn)
+      return;
+
+   fs_remove_node(&plugin.fs, get_node(&plugin.fs, cn->node));
 }
 
 static void
@@ -275,10 +311,7 @@ container_release(struct container *c)
    if (!c)
       return;
 
-   size_t *n;
-   chck_iter_pool_for_each(&c->nodes, n)
-      fs_remove_node(&plugin.fs, get_node(&plugin.fs, *n));
-
+   chck_iter_pool_for_each_call(&c->nodes, cnode_release);
    chck_iter_pool_release(&c->nodes);
    fs_remove_node(&plugin.fs, get_node(&plugin.fs, c->root));
 }
@@ -295,6 +328,7 @@ remove_fs(plugin_h caller, const char *name)
 
    container_release(c);
    chck_hash_table_str_set(&plugin.containers, name, strlen(name), NULL);
+   plog(plugin.self, PLOG_INFO, "removed fs: %s", name);
 }
 
 static void
@@ -302,8 +336,18 @@ remove_fses_for_plugin(plugin_h caller)
 {
    struct container *c;
    chck_hash_table_for_each(&plugin.containers, c) {
-      if (c->owner != caller)
+      if (c->owner != caller) {
+         struct cnode *cn;
+         chck_iter_pool_for_each(&c->nodes, cn) {
+            if (cn->owner != caller)
+               continue;
+
+            cnode_release(cn);
+            chck_iter_pool_remove(&c->nodes, _I - 1);
+            --_I;
+         }
          continue;
+      }
 
       container_release(c);
       memset(c, 0, sizeof(struct container));
@@ -360,11 +404,19 @@ cb_mount(int fd, uint32_t mask, void *arg)
 static void
 output_created(wlc_handle output)
 {
+   struct chck_string tmp = {0};
+   if (chck_string_set_format(&tmp, "output%zu", output - 1))
+      add_fs_to(plugin.fs.root, plugin.self, tmp.data);
+   chck_string_release(&tmp);
 }
 
 static void
 output_destroyed(wlc_handle output)
 {
+   struct chck_string tmp = {0};
+   if (chck_string_set_format(&tmp, "output%zu", output - 1))
+      remove_fs(plugin.self, tmp.data);
+   chck_string_release(&tmp);
 }
 
 static void
@@ -438,8 +490,8 @@ plugin_init(plugin_h self)
       return false;
 
    plog(plugin.self, PLOG_INFO, "9p mountpoint at %s", plugin.path.data);
-   return (add_hook(self, "plugin.deloaded", FUN(plugin_deloaded, "v(h)|1")) ||
-           add_hook(self, "output.created", FUN(output_created, "v(h)|1")) ||
+   return (add_hook(self, "plugin.deloaded", FUN(plugin_deloaded, "v(h)|1")) &&
+           add_hook(self, "output.created", FUN(output_created, "v(h)|1")) &&
            add_hook(self, "output.destroyed", FUN(output_destroyed, "v(h)|1")));
 }
 
@@ -449,7 +501,7 @@ plugin_register(void)
    static const struct method methods[] = {
       REGISTER_METHOD(add_fs, "b(h,c[])|1"),
       REGISTER_METHOD(remove_fs, "v(h,c[])|1"),
-      REGISTER_METHOD(add_node, "b(c[],c[],c[],*,fun,fun,fun,fun)|1"),
+      REGISTER_METHOD(add_node, "b(h,c[],c[],c[],*,fun,fun,fun,fun)|1"),
       REGISTER_METHOD(reply, "b(u16,*,sz,sz,*)|1"),
       {0},
    };

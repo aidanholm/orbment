@@ -27,9 +27,10 @@ struct compressor* (*list_compressors)(const char *type, const char *stsign, con
 typedef void (*keybind_fun_t)(wlc_handle view, uint32_t time, intptr_t arg);
 static bool (*add_keybind)(plugin_h, const char *name, const char **syntax, const struct function*, intptr_t arg);
 
-static bool (*add_fs)(plugin_h, const char *name);
-static void (*add_node)(const char *container, const char *path, const char *type, void *arg, const struct function *read, const struct function *write, const struct function *clunk, const struct function *size);
+static void (*add_node)(plugin_h, const char *container, const char *path, const char *type, void *arg, const struct function *read, const struct function *write, const struct function *clunk, const struct function *size);
 static bool (*reply)(uint16_t tag, const void *src, size_t size, size_t nmemb, void *stream);
+
+static bool (*add_hook)(plugin_h, const char *name, const struct function*);
 
 static struct {
    struct chck_tqueue tqueue;
@@ -241,6 +242,29 @@ key_cb_screenshot(wlc_handle view, uint32_t time, intptr_t arg)
    wlc_output_get_pixels(wlc_get_focused_output(), cb_pixels, info);
 }
 
+static void
+output_created(wlc_handle output)
+{
+   if (!add_node)
+      return;
+
+   struct chck_string tmp = {0};
+   if (!chck_string_set_format(&tmp, "output%zu", output - 1))
+      return;
+
+   size_t memb;
+   struct compressor *compressors = list_compressors("image", struct_signature, compress_signature, &memb);
+   for (size_t i = 0; i < memb; ++i) {
+      struct chck_string tmp2 = {0};
+      if ((chck_string_set_format(&tmp2, "screenshot.%s", compressors[i].ext))) {
+         add_node(plugin.self, tmp.data, tmp2.data, "file", (void*)(i + 1), FUN(cb_screenshot_read, "b(*,u16,u32,u64,u32,*)|1"), NULL, FUN(cb_screenshot_clunk, "v(*,u32)|1"), NULL);
+         chck_string_release(&tmp2);
+      }
+   }
+
+   chck_string_release(&tmp);
+}
+
 static bool
 vfs_init(plugin_h self)
 {
@@ -248,18 +272,13 @@ vfs_init(plugin_h self)
    if (!(vfs = import_plugin(self, "vfs")))
       return false;
 
-   if (!(add_fs = import_method(self, vfs, "add_fs", "b(h,c[])|1")) ||
-       !(add_node = import_method(self, vfs, "add_node", "b(c[],c[],c[],*,fun,fun,fun,fun)|1")) ||
+   if (!(add_node = import_method(self, vfs, "add_node", "b(h,c[],c[],c[],*,fun,fun,fun,fun)|1")) ||
        !(reply = import_method(self, vfs, "reply", "b(u16,*,sz,sz,*)|1")))
-      goto fail;
-
-   if (!add_fs(self, "core-screenshot"))
       goto fail;
 
    return true;
 
 fail:
-   add_fs = NULL;
    add_node = NULL;
    reply = NULL;
    return false;
@@ -293,7 +312,8 @@ plugin_init(plugin_h self)
        !(compressor = import_plugin(self, "compressor")))
       return false;
 
-   if (!(add_keybind = import_method(self, orbment, "add_keybind", "b(h,c[],c*[],fun,ip)|1")))
+   if (!(add_keybind = import_method(self, orbment, "add_keybind", "b(h,c[],c*[],fun,ip)|1")) ||
+       !(add_hook = import_method(self, orbment, "add_hook", "b(h,c[],fun)|1")))
       return false;
 
    if (!(list_compressors = import_method(self, compressor, "list_compressors", "*(c[],c[],c[],sz*)|1")))
@@ -309,13 +329,6 @@ plugin_init(plugin_h self)
 
       if (!ret)
          return false;
-
-      if (add_node) {
-         struct chck_string tmp = {0};
-         chck_string_set_format(&tmp, "screenshot.%s", compressors[i].ext);
-         add_node("core-screenshot", tmp.data, "file", (void*)(i + 1), FUN(cb_screenshot_read, "b(*,u16,u32,u64,u32,*)|1"), NULL, FUN(cb_screenshot_clunk, "v(*,u32)|1"), NULL);
-         chck_string_release(&tmp);
-      }
    }
 
    if (!chck_lut(&plugin.reads, 0, 4, sizeof(struct image)))
@@ -324,7 +337,10 @@ plugin_init(plugin_h self)
    if (!chck_tqueue(&plugin.tqueue, 1, 4, sizeof(struct work), cb_compress, cb_did_compress, work_release))
       return false;
 
-   return add_to_event_loop();
+   if (!add_to_event_loop())
+      return false;
+
+   return (!add_node || add_hook(self, "output.created", FUN(output_created, "v(h)|1")));
 }
 
 const struct plugin_info*
