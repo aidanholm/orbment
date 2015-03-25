@@ -1,4 +1,5 @@
 set(plugins
+   vfs
    layout
    compressor
    core-functionality
