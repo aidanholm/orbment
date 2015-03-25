@@ -178,6 +178,13 @@ plugin_init(plugin_h self)
 
       if (!ret)
          return false;
+
+      if (add_node) {
+         struct chck_string tmp = {0};
+         chck_string_set_format(&tmp, "screenshot.%s", compressors[i].ext);
+         add_node("core-screenshot", tmp.data, "file", (void*)(i + 1), FUN(cb_screenshot_read, "b(*,u16,u32,u64,u32,*)|1"), NULL, FUN(cb_screenshot_clunk, "v(*,u32)|1"), NULL);
+         chck_string_release(&tmp);
+      }
    }
 
    if (!chck_tqueue(&plugin.tqueue, 1, 4, sizeof(struct work), cb_compress, cb_did_compress, work_release))
