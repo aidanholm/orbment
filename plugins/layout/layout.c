@@ -326,6 +326,12 @@ view_state_request(wlc_handle view, const enum wlc_view_state_bit state, const b
 }
 
 static void
+view_created_or_destroyed(wlc_handle view)
+{
+   relayout(wlc_view_get_output(view));
+}
+
+static void
 key_cb_cycle_clients(wlc_handle view, uint32_t time, intptr_t arg)
 {
    (void)view, (void)time, (void)arg;
@@ -381,6 +387,8 @@ plugin_init(plugin_h self)
 
    return (add_hook(self, "plugin.deloaded", FUN(plugin_deloaded, "v(h)|1")) &&
            add_hook(self, "output.resolution", FUN(output_resolution, "v(h,*,*)|1")) &&
+           add_hook(self, "view.created", FUN(view_created_or_destroyed, "v(h)|1")) &&
+           add_hook(self, "view.destroyed", FUN(view_created_or_destroyed, "v(h)|1")) &&
            add_hook(self, "view.geometry_request", FUN(view_geometry_request, "v(h,*)|1")) &&
            add_hook(self, "view.state_request", FUN(view_state_request, "v(h,e,b)|1")));
 }
@@ -395,11 +403,17 @@ plugin_register(void)
       {0},
    };
 
+   static const char *after[] = {
+      "core-functionality",
+      NULL,
+   };
+
    static const struct plugin_info info = {
       .name = "layout",
       .description = "Layout api.",
       .version = VERSION,
       .methods = methods,
+      .after = after,
    };
 
    return &info;
